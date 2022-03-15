@@ -312,8 +312,13 @@ func WithMaxConnBufferSize(maxBufferSize int) connOption {
 func (c *Conn) Close() {
 	close(c.shouldQuit)
 
+	rc, err := c.queueRequest(opClose, &closeRequest{}, &closeResponse{}, nil)
+	if err != nil {
+		return
+	}
+
 	select {
-	case <-c.queueRequest(opClose, &closeRequest{}, &closeResponse{}, nil):
+	case <-rc:
 	case <-time.After(time.Second):
 	}
 }
@@ -486,6 +491,7 @@ func (c *Conn) loop() {
 		case err == ErrSessionExpired:
 			c.logger.Printf("authentication failed: %s", err)
 			c.invalidateWatches(err)
+			c.conn.Close() // session 过期时关闭连接，防止泄露
 		case err != nil && c.conn != nil:
 			c.logger.Printf("authentication failed: %s", err)
 			c.conn.Close()
@@ -508,7 +514,7 @@ func (c *Conn) loop() {
 				if err != nil || c.logInfo {
 					c.logger.Printf("send loop terminated: err=%v", err)
 				}
-				c.conn.Close() // causes recv loop to EOF/exit
+				c.conn.Close() // causes recv loop to EOF/exit  统一关闭了 c.conn，所以 c.sendLoop() 中出错不需要关闭 c.conn
 				wg.Done()
 			}()
 
@@ -767,16 +773,12 @@ func (c *Conn) sendData(req *request) error {
 
 	binary.BigEndian.PutUint32(c.buf[:4], uint32(n))
 
-	c.requestsLock.Lock()
 	select {
 	case <-c.closeChan:
 		req.recvChan <- response{-1, ErrConnectionClosed}
-		c.requestsLock.Unlock()
 		return ErrConnectionClosed
 	default:
 	}
-	c.requests[req.xid] = req
-	c.requestsLock.Unlock()
 
 	if err := c.conn.SetWriteDeadline(time.Now().Add(c.recvTimeout)); err != nil {
 		return err
@@ -784,12 +786,15 @@ func (c *Conn) sendData(req *request) error {
 	_, err = c.conn.Write(c.buf[:n+4])
 	if err != nil {
 		req.recvChan <- response{-1, err}
-		c.conn.Close()
 		return err
 	}
 	if err := c.conn.SetWriteDeadline(time.Time{}); err != nil {
 		return err
 	}
+
+	c.requestsLock.Lock()
+	c.requests[req.xid] = req
+	c.requestsLock.Unlock()
 
 	return nil
 }
@@ -817,7 +822,6 @@ func (c *Conn) sendLoop() error {
 			}
 			_, err = c.conn.Write(c.buf[:n+4])
 			if err != nil {
-				c.conn.Close()
 				return err
 			}
 			if err := c.conn.SetWriteDeadline(time.Time{}); err != nil {
@@ -951,7 +955,15 @@ func (c *Conn) addWatcher(path string, watchType watchType) <-chan Event {
 	return ch
 }
 
-func (c *Conn) queueRequest(opcode int32, req interface{}, res interface{}, recvFunc func(*request, *responseHeader, error)) <-chan response {
+func (c *Conn) queueRequest(opcode int32, req interface{}, res interface{}, recvFunc func(*request, *responseHeader, error)) (<-chan response, error) {
+	select {
+	case <-c.closeChan:
+		return nil, ErrClosing
+	case <-c.shouldQuit:
+		return nil, ErrClosing
+	default:
+	}
+
 	rq := &request{
 		xid:        c.nextXid(),
 		opcode:     opcode,
@@ -960,13 +972,31 @@ func (c *Conn) queueRequest(opcode int32, req interface{}, res interface{}, recv
 		recvChan:   make(chan response, 1),
 		recvFunc:   recvFunc,
 	}
-	c.sendChan <- rq
-	return rq.recvChan
+
+	select {
+	case c.sendChan <- rq:
+		return rq.recvChan, nil
+	case <-c.closeChan:
+		return nil, ErrClosing
+	case <-c.shouldQuit:
+		return nil, ErrClosing
+	}
 }
 
 func (c *Conn) request(opcode int32, req interface{}, res interface{}, recvFunc func(*request, *responseHeader, error)) (int64, error) {
-	r := <-c.queueRequest(opcode, req, res, recvFunc)
-	return r.zxid, r.err
+	rc, err := c.queueRequest(opcode, req, res, recvFunc)
+	if err != nil {
+		return 0, err
+	}
+
+	select {
+	case r := <-rc:
+		return r.zxid, r.err
+	case <-c.closeChan:
+		return 0, ErrClosing
+	case <-c.shouldQuit:
+		return 0, ErrClosing
+	}
 }
 
 func (c *Conn) AddAuth(scheme string, auth []byte) error {
